@@ -23,7 +23,7 @@ from builtins import ValueError
 from collections import defaultdict
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, overload
 
 import torch
 import torch.nn as nn
@@ -277,6 +277,34 @@ def _postprocess_safetensors(
         save_file(sd, str(sf_path), metadata=metadata)
 
 
+@overload
+def collect_shared_input_modules(
+    model: nn.Module,
+    dummy_forward_fn: Callable[[], None],
+    collect_layernorms: bool = False,
+    collect_consumers: Literal[False] = False,
+) -> tuple[dict, dict | None]: ...
+
+
+@overload
+def collect_shared_input_modules(
+    model: nn.Module,
+    dummy_forward_fn: Callable[[], None],
+    collect_layernorms: bool = False,
+    *,
+    collect_consumers: Literal[True],
+) -> tuple[dict, dict | None, dict]: ...
+
+
+@overload
+def collect_shared_input_modules(
+    model: nn.Module,
+    dummy_forward_fn: Callable[[], None],
+    collect_layernorms: bool = False,
+    collect_consumers: bool = False,
+) -> tuple[dict, dict | None] | tuple[dict, dict | None, dict]: ...
+
+
 def collect_shared_input_modules(
     model: nn.Module,
     dummy_forward_fn: Callable[[], None],
@@ -410,6 +438,7 @@ def _fuse_shared_input_modules(
         # Get quantization format for this group of modules
         # (must be re-evaluated per group as different modules may have different formats)
         group_quant_format = get_quantization_format(modules[0]) if modules else quantization_format
+        norm_module = output_to_layernorm.get(tensor) if output_to_layernorm is not None else None
 
         # A fold rewrites the shared-input norm itself (norm_out <- norm_out * pqs), so it is
         # only valid when that norm output feeds nothing but this group: every other consumer
@@ -423,7 +452,7 @@ def _fuse_shared_input_modules(
             and group_quant_format is not None
             and group_quant_format != QUANTIZATION_NONE
             and "awq" in group_quant_format
-            and tensor in output_to_layernorm
+            and norm_module is not None
         )
         out_of_group: list[str] = []
         if fold_eligible and input_to_consumers is not None:
@@ -432,14 +461,10 @@ def _fuse_shared_input_modules(
             names = {
                 n
                 for n in names
-                if not isinstance(
-                    model.get_submodule(n), (TensorQuantizer, SequentialQuantizer)
-                )
+                if not isinstance(model.get_submodule(n), (TensorQuantizer, SequentialQuantizer))
             }
             # drop containers that merely forward the tensor to a module that also got it
-            names = {
-                n for n in names if not any(o != n and o.startswith(n + ".") for o in names)
-            }
+            names = {n for n in names if not any(o != n and o.startswith(n + ".") for o in names)}
             out_of_group = sorted(names - {getattr(m, "name", "") for m in modules})
 
         if len(modules) > 1 and group_quant_format not in [
@@ -472,7 +497,7 @@ def _fuse_shared_input_modules(
                 if out_of_group:
                     warnings.warn(
                         "Not folding pre_quant_scale into "
-                        f"'{getattr(output_to_layernorm[tensor], 'name', '?')}': its output "
+                        f"'{getattr(norm_module, 'name', '?')}': its output "
                         f"also feeds non-fused module(s) {out_of_group}.  Those modules would "
                         "otherwise receive pre_quant_scale-scaled activations; keeping the "
                         "per-module pre_quant_scale instead.  (Do not fold a norm whose output "
@@ -484,9 +509,9 @@ def _fuse_shared_input_modules(
                     fused_count += 1
 
             # Fuse layernorms (for AWQ) -- never when the norm output has other consumers
-            if fold_eligible and not out_of_group:
-                with fsdp2_aware_weight_update(model, output_to_layernorm[tensor]):
-                    fuse_prequant_layernorm(output_to_layernorm[tensor], modules)
+            if fold_eligible and not out_of_group and norm_module is not None:
+                with fsdp2_aware_weight_update(model, norm_module):
+                    fuse_prequant_layernorm(norm_module, modules)
 
     if qkv_only:
         if fused_count > 0:
